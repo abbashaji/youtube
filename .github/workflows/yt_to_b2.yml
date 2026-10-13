@@ -1,10 +1,10 @@
-name: Archive YouTube to Backblaze B2
+name: Universal Video Archiver to Backblaze B2
 
 on:
   workflow_dispatch:
     inputs:
       target_url:
-        description: 'YouTube URL (Single Video, Playlist, or Channel @user/videos)'
+        description: 'URL (YouTube, Twitter/X, TikTok, Instagram, Vimeo, Reddit, etc.)'
         required: true
         type: string
         default: 'https://www.youtube.com/watch?v=EpumXux_HpE'
@@ -44,7 +44,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg aria2 rclone
-          # Install Deno JS runtime required by yt-dlp to solve YouTube JS challenges
+          # Install Deno JS runtime (needed for YouTube & certain challenge-based sites)
           curl -fsSL https://deno.land/install.sh | sh
           echo "$HOME/.deno/bin" >> $GITHUB_PATH
           pip install --upgrade yt-dlp
@@ -74,16 +74,29 @@ jobs:
           touch archive.txt
           mkdir -p downloads
 
-          # 1. Save cookies securely if secret exists
-          COOKIE_ARG=""
-          if [ -n "$YT_COOKIES" ]; then
-            printf "%s\n" "$YT_COOKIES" > cookies.txt
-            COOKIE_ARG="--cookies cookies.txt"
+          # 1. Check if the target is YouTube or another site
+          IS_YOUTUBE=false
+          if echo "$TARGET_URL" | grep -Eq 'youtube\.com|youtu\.be'; then
+            IS_YOUTUBE=true
+            echo "[*] Detected YouTube URL. Applying YouTube-specific bypasses."
+          else
+            echo "[*] Detected non-YouTube URL. Using universal extractor rules."
           fi
 
-          # 2. Resilient format selectors with fallbacks to avoid "Requested format is not available"
-          EXTRA_FLAGS=""
-          OUTPUT_PATH="downloads/%(uploader,channel|Unknown)s/%(upload_date>%Y-%m-%d)s - %(title)s [%(id)s].%(ext)s"
+          # 2. Handle Cookies & Site-Specific Flags
+          SITE_SPECIFIC_ARGS=()
+          if [ "$IS_YOUTUBE" = true ]; then
+            if [ -n "$YT_COOKIES" ]; then
+              printf "%s\n" "$YT_COOKIES" > cookies.txt
+              SITE_SPECIFIC_ARGS+=(--cookies cookies.txt)
+            fi
+            SITE_SPECIFIC_ARGS+=(--remote-components ejs:github)
+            SITE_SPECIFIC_ARGS+=(--extractor-args "youtube:player_client=web,tv")
+          fi
+
+          # 3. Resilient Format Selectors across all sites
+          EXTRA_FLAGS=()
+          OUTPUT_PATH="downloads/%(extractor)s/%(uploader,channel|Unknown)s/%(upload_date>%Y-%m-%d)s - %(title)s [%(id)s].%(ext)s"
 
           case "$QUALITY" in
             4k_best)
@@ -107,29 +120,27 @@ jobs:
           esac
 
           if [ -n "$MAX_DOWNLOADS" ] && [ "$MAX_DOWNLOADS" != "0" ]; then
-            EXTRA_FLAGS="$EXTRA_FLAGS --max-downloads $MAX_DOWNLOADS"
+            EXTRA_FLAGS+=(--max-downloads "$MAX_DOWNLOADS")
           fi
 
           echo "[*] Target URL: $TARGET_URL"
 
-          # 3. Run yt-dlp with Deno ejs component download & cookie-compatible player clients
+          # 4. Universal Download and Upload Execution
           yt-dlp \
             "${FORMAT_ARGS[@]}" \
-            $EXTRA_FLAGS \
-            $COOKIE_ARG \
-            --remote-components ejs:github \
-            --extractor-args "youtube:player_client=web,tv" \
+            "${EXTRA_FLAGS[@]}" \
+            "${SITE_SPECIFIC_ARGS[@]}" \
             --download-archive "archive.txt" \
             --output "$OUTPUT_PATH" \
             --external-downloader aria2c \
             --external-downloader-args "aria2c:-x 16 -s 16 -k 1M" \
-            --sleep-interval 2 \
-            --max-sleep-interval 6 \
+            --sleep-interval 1 \
+            --max-sleep-interval 4 \
             --ignore-errors \
-            --exec "rclone copy {} b2:${BUCKET}/youtube/ && rm -f {}" \
+            --exec "rclone copy {} b2:${BUCKET}/%(extractor)s/ && rm -f {}" \
             "$TARGET_URL"
 
-          # Clean up cookies file
+          # Clean up temporary cookie file if created
           rm -f cookies.txt
 
       - name: Commit and Push Updated archive.txt
