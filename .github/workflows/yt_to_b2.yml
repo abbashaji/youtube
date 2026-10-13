@@ -1,3 +1,67 @@
+name: Universal Video Archiver to Backblaze B2
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_urls:
+        description: 'Video/Playlist/Channel URLs (one per line or single URL)'
+        required: true
+        type: string
+        default: 'https://www.youtube.com/watch?v=OiJ5jvi4WzU'
+
+      quality:
+        description: 'Select Video / Audio Quality'
+        required: true
+        type: choice
+        default: '1080p'
+        options:
+          - '4k_best'
+          - '1080p'
+          - '720p'
+          - '480p'
+          - 'audio_only_mp3'
+          - 'audio_only_best'
+
+      max_downloads:
+        description: 'Max items to download this run (leave blank or 0 for unlimited)'
+        required: false
+        type: string
+        default: '25'
+
+jobs:
+  archive-to-b2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies (FFmpeg, aria2, rclone, Deno)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg aria2 rclone
+          curl -fsSL https://deno.land/install.sh | sh
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
+          pip install --upgrade yt-dlp
+
+      - name: Configure rclone for Backblaze B2
+        env:
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APP_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+        run: |
+          mkdir -p ~/.config/rclone
+          cat <<EOF > ~/.config/rclone/rclone.conf
+          [b2]
+          type = b2
+          account = ${B2_KEY_ID}
+          key = ${B2_APP_KEY}
+          hard_delete = true
+          EOF
+
       - name: Download & Upload Stream to B2
         env:
           RAW_URLS: ${{ inputs.target_urls }}
@@ -9,15 +73,15 @@
           touch archive.txt
           mkdir -p downloads
 
-          # 1. Parse and sanitize input URLs into links.txt
+          # Parse and sanitize input URLs into links.txt
           printf "%s\n" "$RAW_URLS" | sed '/^[[:space:]]*$/d' > links.txt
           echo "[*] Queued URLs for download:"
           cat links.txt
 
-          # 2. Check if any YouTube URL is present in the list
+          # Check if YouTube URL is present
           SITE_SPECIFIC_ARGS=()
           if grep -Eq 'youtube\.com|youtu\.be' links.txt; then
-            echo "[*] YouTube URL detected in batch. Applying YouTube challenge solvers & cookies."
+            echo "[*] YouTube URL detected. Applying bypasses."
             if [ -n "$YT_COOKIES" ]; then
               printf "%s\n" "$YT_COOKIES" > cookies.txt
               SITE_SPECIFIC_ARGS+=(--cookies cookies.txt)
@@ -26,7 +90,7 @@
             SITE_SPECIFIC_ARGS+=(--extractor-args "youtube:player_client=web,tv")
           fi
 
-          # 3. Format Selectors
+          # Format Selector
           EXTRA_FLAGS=()
           OUTPUT_PATH="downloads/%(extractor)s/%(uploader,channel|Unknown)s/%(upload_date>%Y-%m-%d)s - %(title)s [%(id)s].%(ext)s"
 
@@ -55,9 +119,7 @@
             EXTRA_FLAGS+=(--max-downloads "$MAX_DOWNLOADS")
           fi
 
-          # 4. Run yt-dlp:
-          # - --ignore-errors / -i: continue past errors
-          # - --no-abort-on-error: do not stop the batch process on fatal extractor errors
+          # Execute yt-dlp with tolerance for individual link failures
           yt-dlp \
             "${FORMAT_ARGS[@]}" \
             "${EXTRA_FLAGS[@]}" \
@@ -74,8 +136,19 @@
             -a links.txt || YTDLP_EXIT_CODE=$?
 
           if [ "${YTDLP_EXIT_CODE:-0}" -ne 0 ]; then
-            echo "::warning::yt-dlp finished with exit code $YTDLP_EXIT_CODE (one or more items were skipped or failed), but valid links were processed."
+            echo "::warning::One or more links failed or were skipped (code: $YTDLP_EXIT_CODE), but valid downloads proceeded."
           fi
 
-          # Clean up temporary files
           rm -f cookies.txt links.txt
+
+      - name: Commit and Push Updated archive.txt
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add archive.txt
+          if git diff --staged --quiet; then
+            echo "No changes to archive.txt"
+          else
+            git commit -m "Update download archive [skip ci]"
+            git push
+          fi
