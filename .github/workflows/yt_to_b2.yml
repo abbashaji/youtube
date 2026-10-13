@@ -7,7 +7,7 @@ on:
         description: 'YouTube URL (Single Video, Playlist, or Channel @user/videos)'
         required: true
         type: string
-        default: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'
+        default: 'https://www.youtube.com/watch?v=EpumXux_HpE'
 
       quality:
         description: 'Select Video / Audio Quality'
@@ -31,19 +31,22 @@ on:
 jobs:
   archive-to-b2:
     runs-on: ubuntu-latest
-    timeout-minutes: 350 # Stays safely under GitHub's 6-hour execution limit
+    timeout-minutes: 350
 
     permissions:
-      contents: write # Needed to commit and push archive.txt back to repo
+      contents: write
 
     steps:
-      - name: Checkout Repository (For archive.txt persistence)
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install yt-dlp, FFmpeg, aria2, and rclone
+      - name: Install Dependencies (FFmpeg, aria2, rclone, Deno)
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg aria2 rclone
+          # Install Deno JS runtime for yt-dlp JavaScript challenge solver
+          curl -fsSL https://deno.land/install.sh | sh
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
           pip install --upgrade yt-dlp
 
       - name: Configure rclone for Backblaze B2
@@ -66,12 +69,19 @@ jobs:
           QUALITY: ${{ inputs.quality }}
           MAX_DOWNLOADS: ${{ inputs.max_downloads }}
           BUCKET: ${{ secrets.B2_BUCKET_NAME }}
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
         run: |
-          # 1. Initialize archive.txt if new
           touch archive.txt
           mkdir -p downloads
 
-          # 2. Configure format flags based on user selection
+          # Save cookies to temporary file if secret is provided
+          COOKIE_ARG=""
+          if [ -n "$YT_COOKIES" ]; then
+            echo "$YT_COOKIES" > cookies.txt
+            COOKIE_ARG="--cookies cookies.txt"
+          fi
+
+          # Quality selections
           EXTRA_FLAGS=""
           OUTPUT_PATH="downloads/%(uploader,channel|Unknown)s/%(upload_date>%Y-%m-%d)s - %(title)s [%(id)s].%(ext)s"
 
@@ -96,28 +106,30 @@ jobs:
               ;;
           esac
 
-          # 3. Handle max downloads if specified
           if [ -n "$MAX_DOWNLOADS" ] && [ "$MAX_DOWNLOADS" != "0" ]; then
             EXTRA_FLAGS="$EXTRA_FLAGS --max-downloads $MAX_DOWNLOADS"
           fi
 
           echo "[*] Target URL: $TARGET_URL"
-          echo "[*] Format Flags: $FORMAT_FLAG"
 
-          # 4. Execute yt-dlp
-          # Uploads each file immediately with rclone and removes it to save runner disk
+          # Run yt-dlp with iOS/Android client fallbacks and JS runtime
           yt-dlp \
             $FORMAT_FLAG \
             $EXTRA_FLAGS \
+            $COOKIE_ARG \
+            --extractor-args "youtube:player_client=ios,android,web" \
             --download-archive "archive.txt" \
             --output "$OUTPUT_PATH" \
             --external-downloader aria2c \
-            --external-downloader-args "-x 16 -s 16 -k 1M" \
-            --sleep-interval 3 \
-            --max-sleep-interval 8 \
+            --external-downloader-args "aria2c:-x 16 -s 16 -k 1M" \
+            --sleep-interval 2 \
+            --max-sleep-interval 6 \
             --ignore-errors \
             --exec "rclone copy {} b2:${BUCKET}/youtube/ && rm -f {}" \
             "$TARGET_URL"
+
+          # Remove cookies file after job completes
+          rm -f cookies.txt
 
       - name: Commit and Push Updated archive.txt
         run: |
