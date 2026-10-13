@@ -101,10 +101,18 @@ jobs:
           cat > upload.sh <<'EOF'
           #!/usr/bin/env bash
           # Called by yt-dlp --exec with the final file path as $1.
-          # Destination is derived from the (already sanitized) local path, so
-          # uploader names with "/" can never create extra nested folders in B2.
+          # yt-dlp may pass an ABSOLUTE path (/home/runner/work/<repo>/<repo>/downloads/...),
+          # so resolve it and strip the absolute downloads/ prefix. The bucket path is then
+          # exactly: youtube/<channel or playlist>/<file>  or  other/<site>/<file>.
           f="$1"
-          rel="${f#downloads/}"
+          base="$(pwd)/downloads/"
+          abs="$(realpath "$f")"
+          rel="${abs#"$base"}"
+          if [ "$rel" = "$abs" ]; then
+            echo "::error::File is outside downloads/: $f"
+            echo "$f" >> upload_failed.txt
+            exit 1
+          fi
           if rclone moveto "$f" "b2:${BUCKET}/${rel}" --retries 5 --low-level-retries 10; then
             echo "[↑] Uploaded: ${rel}"
           else
@@ -159,7 +167,11 @@ jobs:
           # 3. Format selection
           # height<=?N : excludes formats taller than N, but keeps formats with unknown height
           # (no unbounded "/best" fallback). Merge to mp4 when compatible, otherwise mkv.
-          OUTPUT_PATH="downloads/%(extractor)s/%(uploader,channel|Unknown)s/%(upload_date>%Y-%m-%d|0000-00-00)s - %(title)s [%(id)s].%(ext)s"
+          # Output layout in B2 (only two top-level folders):
+          #   youtube/<playlist title>/...   for YouTube playlist URLs (list=... or /playlist)
+          #   youtube/<channel name>/...     for YouTube channel URLs and single videos
+          #   other/<site domain>/...        for every other site
+          FILE_TPL="%(upload_date>%Y-%m-%d|0000-00-00)s - %(title)s [%(id)s].%(ext)s"
           FORMAT_ARGS=()
           H=""
           case "$QUALITY" in
@@ -197,17 +209,26 @@ jobs:
             echo "============================================================"
 
             SITE_ARGS=()
-            if echo "$url" | grep -Eq 'youtube\.com|youtu\.be'; then
+            if echo "$url" | grep -Eq 'youtube\.com|youtu\.be|youtube-nocookie\.com'; then
               # Gentle on YouTube: no multi-connection downloader, longer sleeps,
               # default player clients (better maintained than a forced list).
               if [ -f cookies.txt ]; then
                 SITE_ARGS+=(--cookies cookies.txt)
               fi
               SITE_ARGS+=(--sleep-interval 5 --max-sleep-interval 15)
+              if echo "$url" | grep -Eq '[?&]list=|/playlist'; then
+                # Playlist: its own folder named after the playlist
+                OUTPUT_PATH="downloads/youtube/%(playlist_title|Unknown Playlist)s/${FILE_TPL}"
+              else
+                # Channel (or single video): folder named after the channel
+                OUTPUT_PATH="downloads/youtube/%(channel,uploader|Unknown Channel)s/${FILE_TPL}"
+              fi
             else
               SITE_ARGS+=(--external-downloader aria2c --external-downloader-args "aria2c:-x 16 -s 16 -k 1M")
               SITE_ARGS+=(--sleep-interval 1 --max-sleep-interval 4)
+              OUTPUT_PATH="downloads/other/%(webpage_url_domain,extractor|Unknown)s/${FILE_TPL}"
             fi
+            echo "[*] Output template: $OUTPUT_PATH"
 
             rc=0
             yt-dlp \
