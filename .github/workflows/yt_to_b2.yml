@@ -125,7 +125,7 @@ jobs:
 
           echo "[*] Target URL: $TARGET_URL"
 
-          # 4. Execute download with safe %(extractor)q escaping
+          # 4. Execute download with %(filepath)q for safe rclone file moving
           yt-dlp \
             "${FORMAT_ARGS[@]}" \
             "${EXTRA_FLAGS[@]}" \
@@ -137,7 +137,7 @@ jobs:
             --sleep-interval 1 \
             --max-sleep-interval 4 \
             --ignore-errors \
-            --exec "rclone move {} b2:${BUCKET}/%(extractor)q/ --delete-empty-src-dirs" \
+            --exec "rclone move %(filepath)q b2:${BUCKET}/%(extractor)q/%(uploader,channel|Unknown)q/ --delete-empty-src-dirs" \
             "$TARGET_URL"
 
           # Clean up temporary cookie file if created
