@@ -44,7 +44,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg aria2 rclone
-          # Install Deno JS runtime for yt-dlp JavaScript challenge solver
+          # Install Deno JS runtime required by yt-dlp to solve YouTube JS challenges
           curl -fsSL https://deno.land/install.sh | sh
           echo "$HOME/.deno/bin" >> $GITHUB_PATH
           pip install --upgrade yt-dlp
@@ -74,35 +74,35 @@ jobs:
           touch archive.txt
           mkdir -p downloads
 
-          # Save cookies to temporary file if secret is provided
+          # 1. Save cookies securely if secret exists
           COOKIE_ARG=""
           if [ -n "$YT_COOKIES" ]; then
-            echo "$YT_COOKIES" > cookies.txt
+            printf "%s\n" "$YT_COOKIES" > cookies.txt
             COOKIE_ARG="--cookies cookies.txt"
           fi
 
-          # Quality selections
+          # 2. Resilient format selectors with fallbacks to avoid "Requested format is not available"
           EXTRA_FLAGS=""
           OUTPUT_PATH="downloads/%(uploader,channel|Unknown)s/%(upload_date>%Y-%m-%d)s - %(title)s [%(id)s].%(ext)s"
 
           case "$QUALITY" in
             4k_best)
-              FORMAT_FLAG='-f bestvideo+bestaudio/best --merge-output-format mp4'
+              FORMAT_ARGS=(-f "bv*+ba/b" --merge-output-format mp4)
               ;;
             1080p)
-              FORMAT_FLAG='-f bestvideo[height<=1080]+bestaudio/best[height<=1080] --merge-output-format mp4'
+              FORMAT_ARGS=(-f "bv*[height<=1080]+ba/b[height<=1080]/best" --merge-output-format mp4)
               ;;
             720p)
-              FORMAT_FLAG='-f bestvideo[height<=720]+bestaudio/best[height<=720] --merge-output-format mp4'
+              FORMAT_ARGS=(-f "bv*[height<=720]+ba/b[height<=720]/best" --merge-output-format mp4)
               ;;
             480p)
-              FORMAT_FLAG='-f bestvideo[height<=480]+bestaudio/best[height<=480] --merge-output-format mp4'
+              FORMAT_ARGS=(-f "bv*[height<=480]+ba/b[height<=480]/best" --merge-output-format mp4)
               ;;
             audio_only_mp3)
-              FORMAT_FLAG='-x --audio-format mp3 --audio-quality 0 --embed-thumbnail --add-metadata'
+              FORMAT_ARGS=(-x --audio-format mp3 --audio-quality 0 --embed-thumbnail --add-metadata)
               ;;
             audio_only_best)
-              FORMAT_FLAG='-x --audio-format best --audio-quality 0 --embed-thumbnail --add-metadata'
+              FORMAT_ARGS=(-x --audio-format best --audio-quality 0 --embed-thumbnail --add-metadata)
               ;;
           esac
 
@@ -112,12 +112,13 @@ jobs:
 
           echo "[*] Target URL: $TARGET_URL"
 
-          # Run yt-dlp with iOS/Android client fallbacks and JS runtime
+          # 3. Run yt-dlp with Deno ejs component download & cookie-compatible player clients
           yt-dlp \
-            $FORMAT_FLAG \
+            "${FORMAT_ARGS[@]}" \
             $EXTRA_FLAGS \
             $COOKIE_ARG \
-            --extractor-args "youtube:player_client=ios,android,web" \
+            --remote-components ejs:github \
+            --extractor-args "youtube:player_client=web,tv" \
             --download-archive "archive.txt" \
             --output "$OUTPUT_PATH" \
             --external-downloader aria2c \
@@ -128,7 +129,7 @@ jobs:
             --exec "rclone copy {} b2:${BUCKET}/youtube/ && rm -f {}" \
             "$TARGET_URL"
 
-          # Remove cookies file after job completes
+          # Clean up cookies file
           rm -f cookies.txt
 
       - name: Commit and Push Updated archive.txt
