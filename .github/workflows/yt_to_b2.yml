@@ -3,11 +3,13 @@ name: Universal Video Archiver to Backblaze B2
 on:
   workflow_dispatch:
     inputs:
-      target_url:
-        description: 'URL (YouTube, Twitter/X, TikTok, Instagram, Vimeo, Reddit, etc.)'
+      target_urls:
+        description: 'Video/Playlist/Channel URLs (One URL per line)'
         required: true
         type: string
-        default: 'https://www.youtube.com/watch?v=EpumXux_HpE'
+        default: |
+          https://www.youtube.com/watch?v=OiJ5jvi4WzU
+          https://www.youtube.com/watch?v=EpumXux_HpE
 
       quality:
         description: 'Select Video / Audio Quality'
@@ -44,7 +46,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg aria2 rclone
-          # Install Deno JS runtime (needed for YouTube & JS challenge-based extractors)
+          # Install latest Deno runtime for YouTube JS challenges
           curl -fsSL https://deno.land/install.sh | sh
           echo "$HOME/.deno/bin" >> $GITHUB_PATH
           pip install --upgrade yt-dlp
@@ -65,7 +67,7 @@ jobs:
 
       - name: Download & Upload Stream to B2
         env:
-          TARGET_URL: ${{ inputs.target_url }}
+          RAW_URLS: ${{ inputs.target_urls }}
           QUALITY: ${{ inputs.quality }}
           MAX_DOWNLOADS: ${{ inputs.max_downloads }}
           BUCKET: ${{ secrets.B2_BUCKET_NAME }}
@@ -74,18 +76,15 @@ jobs:
           touch archive.txt
           mkdir -p downloads
 
-          # 1. Detect if the target is YouTube or another site
-          IS_YOUTUBE=false
-          if echo "$TARGET_URL" | grep -Eq 'youtube\.com|youtu\.be'; then
-            IS_YOUTUBE=true
-            echo "[*] Detected YouTube URL. Applying YouTube-specific bypasses."
-          else
-            echo "[*] Detected non-YouTube URL. Using universal extractor rules."
-          fi
+          # 1. Parse and sanitize input URLs into links.txt
+          printf "%s\n" "$RAW_URLS" | sed '/^[[:space:]]*$/d' > links.txt
+          echo "[*] Queued URLs for download:"
+          cat links.txt
 
-          # 2. Site-specific flags and authentication
+          # 2. Check if any YouTube URL is present in the list
           SITE_SPECIFIC_ARGS=()
-          if [ "$IS_YOUTUBE" = true ]; then
+          if grep -Eq 'youtube\.com|youtu\.be' links.txt; then
+            echo "[*] YouTube URL detected in batch. Applying YouTube challenge solvers & cookies."
             if [ -n "$YT_COOKIES" ]; then
               printf "%s\n" "$YT_COOKIES" > cookies.txt
               SITE_SPECIFIC_ARGS+=(--cookies cookies.txt)
@@ -123,9 +122,7 @@ jobs:
             EXTRA_FLAGS+=(--max-downloads "$MAX_DOWNLOADS")
           fi
 
-          echo "[*] Target URL: $TARGET_URL"
-
-          # 4. Execute download with %(filepath)q for safe rclone file moving
+          # 4. Run yt-dlp using --batch-file (-a)
           yt-dlp \
             "${FORMAT_ARGS[@]}" \
             "${EXTRA_FLAGS[@]}" \
@@ -138,10 +135,10 @@ jobs:
             --max-sleep-interval 4 \
             --ignore-errors \
             --exec "rclone move %(filepath)q b2:${BUCKET}/%(extractor)q/%(uploader,channel|Unknown)q/ --delete-empty-src-dirs" \
-            "$TARGET_URL"
+            -a links.txt
 
-          # Clean up temporary cookie file if created
-          rm -f cookies.txt
+          # Clean up temporary files
+          rm -f cookies.txt links.txt
 
       - name: Commit and Push Updated archive.txt
         run: |
