@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       target_urls:
-        description: 'Video/Playlist/Channel URLs (one per line or single URL)'
+        description: 'Video/Playlist/Channel URLs (paste several; separated by space, comma or newline)'
         required: true
         type: string
         default: 'https://www.youtube.com/watch?v=OiJ5jvi4WzU'
@@ -23,10 +23,15 @@ on:
           - 'audio_only_best'
 
       max_downloads:
-        description: 'Max items per target URL (leave blank or 0 for unlimited)'
+        description: 'Max NEW items per target URL (blank or 0 = unlimited)'
         required: false
         type: string
         default: '25'
+
+# Only one archiver run at a time, so archive commits never race.
+concurrency:
+  group: video-archiver
+  cancel-in-progress: false
 
 jobs:
   archive-to-b2:
@@ -38,133 +43,251 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Install Dependencies (FFmpeg, aria2, rclone, Deno)
+      - name: Free up runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Set up Deno (JS runtime for YouTube challenges)
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: '2.1.4'   # pinned; yt-dlp needs Deno >= 2.0
+
+      - name: Install Dependencies (FFmpeg, aria2, rclone, yt-dlp)
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg aria2 rclone
-          curl -fsSL https://deno.land/install.sh | sh
-          echo "$HOME/.deno/bin" >> $GITHUB_PATH
-          pip install --upgrade yt-dlp
+          sudo apt-get install -y --no-install-recommends ffmpeg aria2
+          # Pinned rclone release (apt's version is outdated)
+          curl -fsSL -o /tmp/rclone.deb "https://downloads.rclone.org/v1.68.2/rclone-v1.68.2-linux-amd64.deb"
+          sudo dpkg -i /tmp/rclone.deb
+          # yt-dlp is intentionally unpinned (extractors break fast). [default] bundles the
+          # JS challenge solver, mutagen and other optional deps.
+          pip install --upgrade "yt-dlp[default]"
+          yt-dlp --version
+          rclone version | head -n1
+          deno --version | head -n1
 
-      - name: Configure rclone for Backblaze B2
+      - name: Validate inputs, secrets and B2 connectivity
         env:
+          RAW_URLS: ${{ inputs.target_urls }}
+          MAX_DOWNLOADS: ${{ inputs.max_downloads }}
           B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
           B2_APP_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          BUCKET: ${{ secrets.B2_BUCKET_NAME }}
+          RCLONE_CONFIG_B2_TYPE: b2
+          RCLONE_CONFIG_B2_ACCOUNT: ${{ secrets.B2_KEY_ID }}
+          RCLONE_CONFIG_B2_KEY: ${{ secrets.B2_APPLICATION_KEY }}
         run: |
-          mkdir -p ~/.config/rclone
-          cat <<EOF > ~/.config/rclone/rclone.conf
-          [b2]
-          type = b2
-          account = ${B2_KEY_ID}
-          key = ${B2_APP_KEY}
-          hard_delete = true
+          fail() { echo "::error::$1"; exit 1; }
+
+          [ -n "$B2_KEY_ID" ]  || fail "Secret B2_KEY_ID is missing or empty"
+          [ -n "$B2_APP_KEY" ] || fail "Secret B2_APPLICATION_KEY is missing or empty"
+          [ -n "$BUCKET" ]     || fail "Secret B2_BUCKET_NAME is missing or empty"
+
+          if [ -n "$MAX_DOWNLOADS" ] && ! [[ "$MAX_DOWNLOADS" =~ ^[0-9]+$ ]]; then
+            fail "max_downloads must be a non-negative integer (got: '$MAX_DOWNLOADS')"
+          fi
+
+          [ -n "$(printf '%s' "$RAW_URLS" | tr -d '[:space:]')" ] || fail "No URLs provided"
+
+          echo "[*] Checking access to bucket '$BUCKET' ..."
+          rclone lsd "b2:${BUCKET}" > /dev/null || fail "Cannot access B2 bucket '$BUCKET' (check key, permissions, bucket name)"
+          echo "[✓] B2 connection OK"
+
+      - name: Create upload helper
+        run: |
+          cat > upload.sh <<'EOF'
+          #!/usr/bin/env bash
+          # Called by yt-dlp --exec with the final file path as $1.
+          # Destination is derived from the (already sanitized) local path, so
+          # uploader names with "/" can never create extra nested folders in B2.
+          f="$1"
+          rel="${f#downloads/}"
+          if rclone moveto "$f" "b2:${BUCKET}/${rel}" --retries 5 --low-level-retries 10; then
+            echo "[↑] Uploaded: ${rel}"
+          else
+            echo "::error::Upload failed: ${rel}"
+            echo "$f" >> upload_failed.txt
+            exit 1
+          fi
           EOF
+          chmod +x upload.sh
 
       - name: Download & Upload Stream to B2
+        timeout-minutes: 330   # leaves time for the archive commit step before the job limit
         env:
           RAW_URLS: ${{ inputs.target_urls }}
           QUALITY: ${{ inputs.quality }}
           MAX_DOWNLOADS: ${{ inputs.max_downloads }}
           BUCKET: ${{ secrets.B2_BUCKET_NAME }}
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
+          RCLONE_CONFIG_B2_TYPE: b2
+          RCLONE_CONFIG_B2_ACCOUNT: ${{ secrets.B2_KEY_ID }}
+          RCLONE_CONFIG_B2_KEY: ${{ secrets.B2_APPLICATION_KEY }}
         run: |
-          touch archive.txt
-          mkdir -p downloads
+          # Separate archive per quality, so a 480p archive never blocks a later 4K request.
+          ARCHIVE="archives/${QUALITY}.txt"
+          mkdir -p archives downloads
+          touch "$ARCHIVE"
+          rm -f upload_failed.txt
+          trap 'rm -f cookies.txt links.txt' EXIT
 
-          # 1. Parse and sanitize input URLs (strip carriage returns and blank lines)
-          printf "%s\n" "$RAW_URLS" | tr -d '\r' | sed '/^[[:space:]]*$/d' > links.txt
-          echo "[*] Total queued URLs: $(wc -l < links.txt)"
+          # 1. Parse input. The GitHub web UI input box is single-line, so pasted line breaks
+          #    may be removed or turned into spaces. Therefore: drop comment lines, split on
+          #    whitespace AND before every http(s):// (handles URLs glued together), strip
+          #    trailing , or ; , keep only http(s) URLs, remove duplicates.
+          printf "%s\n" "$RAW_URLS" | tr -d '\r' \
+            | sed -E '/^[[:space:]]*#/d' \
+            | sed -E 's/[[:space:]]+/\n/g; s#(https?://)#\n\1#g' \
+            | sed -E 's/[,;]+$//' \
+            | grep -E '^https?://' \
+            | awk '!seen[$0]++' > links.txt || true
+          TOTAL=$(wc -l < links.txt)
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "::error::No valid URLs after parsing"
+            exit 1
+          fi
+          echo "[*] Total queued URLs: $TOTAL"
 
-          # 2. Setup cookies if provided
+          # 2. Cookies (restricted permissions, removed on exit)
           if [ -n "$YT_COOKIES" ]; then
-            printf "%s\n" "$YT_COOKIES" > cookies.txt
+            ( umask 077; printf "%s\n" "$YT_COOKIES" > cookies.txt )
           fi
 
-          # 3. Format Selectors
-          EXTRA_FLAGS=()
-          OUTPUT_PATH="downloads/%(extractor)s/%(uploader,channel|Unknown)s/%(upload_date>%Y-%m-%d)s - %(title)s [%(id)s].%(ext)s"
-
+          # 3. Format selection
+          # height<=?N : excludes formats taller than N, but keeps formats with unknown height
+          # (no unbounded "/best" fallback). Merge to mp4 when compatible, otherwise mkv.
+          OUTPUT_PATH="downloads/%(extractor)s/%(uploader,channel|Unknown)s/%(upload_date>%Y-%m-%d|0000-00-00)s - %(title)s [%(id)s].%(ext)s"
+          FORMAT_ARGS=()
+          H=""
           case "$QUALITY" in
-            4k_best)
-              FORMAT_ARGS=(-f "bv*+ba/b" --merge-output-format mp4)
-              ;;
-            1080p)
-              FORMAT_ARGS=(-f "bv*[height<=1080]+ba/b[height<=1080]/best" --merge-output-format mp4)
-              ;;
-            720p)
-              FORMAT_ARGS=(-f "bv*[height<=720]+ba/b[height<=720]/best" --merge-output-format mp4)
-              ;;
-            480p)
-              FORMAT_ARGS=(-f "bv*[height<=480]+ba/b[height<=480]/best" --merge-output-format mp4)
-              ;;
-            audio_only_mp3)
-              FORMAT_ARGS=(-x --audio-format mp3 --audio-quality 0 --embed-thumbnail --add-metadata)
-              ;;
-            audio_only_best)
-              FORMAT_ARGS=(-x --audio-format best --audio-quality 0 --embed-thumbnail --add-metadata)
-              ;;
+            4k_best)         H=2160 ;;
+            1080p)           H=1080 ;;
+            720p)            H=720 ;;
+            480p)            H=480 ;;
+            audio_only_mp3)  FORMAT_ARGS=(-x --audio-format mp3 --audio-quality 0 --embed-thumbnail --embed-metadata) ;;
+            audio_only_best) FORMAT_ARGS=(-x --audio-format best --audio-quality 0 --embed-thumbnail --embed-metadata) ;;
+            *) echo "::error::Unknown quality '$QUALITY'"; exit 1 ;;
           esac
-
-          if [ -n "$MAX_DOWNLOADS" ] && [ "$MAX_DOWNLOADS" != "0" ]; then
-            EXTRA_FLAGS+=(--max-downloads "$MAX_DOWNLOADS")
+          if [ -n "$H" ]; then
+            FORMAT_ARGS=(-f "bv*[height<=?${H}]+ba/b[height<=?${H}]" -S "res,ext:mp4:m4a" --merge-output-format "mp4/mkv" --embed-metadata)
           fi
 
-          # 4. Loop URL-by-URL so a 404/broken link never aborts the other URLs
+          EXTRA_FLAGS=()
+          if [ -n "$MAX_DOWNLOADS" ] && [ "$MAX_DOWNLOADS" != "0" ]; then
+            if [[ "$MAX_DOWNLOADS" =~ ^[0-9]+$ ]]; then
+              EXTRA_FLAGS+=(--max-downloads "$MAX_DOWNLOADS")
+            else
+              echo "::error::max_downloads must be numeric"
+              exit 1
+            fi
+          fi
+
+          # 4. Process URL by URL. Read the list on fd 3 so nothing inside the loop
+          #    (ffmpeg, aria2c, rclone, ...) can swallow the remaining URLs from stdin.
           FAILED_COUNT=0
           SUCCESS_COUNT=0
+          FAILED_URLS=()
 
-          while IFS= read -r url || [ -n "$url" ]; do
-            [[ -z "$url" || "$url" =~ ^[[:space:]]*# ]] && continue
-
+          while IFS= read -r -u 3 url; do
             echo "============================================================"
             echo "[*] Processing target: $url"
             echo "============================================================"
 
-            CURRENT_SITE_ARGS=()
+            SITE_ARGS=()
             if echo "$url" | grep -Eq 'youtube\.com|youtu\.be'; then
-              [ -f cookies.txt ] && CURRENT_SITE_ARGS+=(--cookies cookies.txt)
-              CURRENT_SITE_ARGS+=(--remote-components ejs:github)
-              CURRENT_SITE_ARGS+=(--extractor-args "youtube:player_client=web,tv")
+              # Gentle on YouTube: no multi-connection downloader, longer sleeps,
+              # default player clients (better maintained than a forced list).
+              if [ -f cookies.txt ]; then
+                SITE_ARGS+=(--cookies cookies.txt)
+              fi
+              SITE_ARGS+=(--sleep-interval 5 --max-sleep-interval 15)
+            else
+              SITE_ARGS+=(--external-downloader aria2c --external-downloader-args "aria2c:-x 16 -s 16 -k 1M")
+              SITE_ARGS+=(--sleep-interval 1 --max-sleep-interval 4)
             fi
 
-            if yt-dlp \
+            rc=0
+            yt-dlp \
               "${FORMAT_ARGS[@]}" \
               "${EXTRA_FLAGS[@]}" \
-              "${CURRENT_SITE_ARGS[@]}" \
-              --download-archive "archive.txt" \
+              "${SITE_ARGS[@]}" \
+              --download-archive "$ARCHIVE" \
               --output "$OUTPUT_PATH" \
-              --external-downloader aria2c \
-              --external-downloader-args "aria2c:-x 16 -s 16 -k 1M" \
-              --sleep-interval 1 \
-              --max-sleep-interval 4 \
+              --trim-filenames 200 \
               --ignore-errors \
-              --exec "rclone move %(filepath)q b2:${BUCKET}/%(extractor)q/%(uploader,channel|Unknown)q/ --delete-empty-src-dirs" \
-              "$url"; then
+              --exec "bash ./upload.sh" \
+              "$url" < /dev/null || rc=$?
+
+            # Exit code 101 = --max-downloads limit reached (expected, not an error)
+            if [ "$rc" -eq 0 ] || [ "$rc" -eq 101 ]; then
+              if [ "$rc" -eq 101 ]; then
+                echo "[✓] Reached max-downloads limit for: $url"
+              else
                 echo "[✓] Finished processing: $url"
-                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+              fi
+              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
             else
-                echo "::warning::Skipping bad/broken link (404/Private/Deleted): $url"
-                FAILED_COUNT=$((FAILED_COUNT + 1))
+              echo "::error::yt-dlp exited with code $rc for: $url (some or all items failed)"
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+              FAILED_URLS+=("$url")
             fi
 
-          done < links.txt
+            # Safety sweep: upload anything left behind (e.g. a transient upload failure),
+            # then delete leftover partial/intermediate files so disk never fills up.
+            if rclone move downloads "b2:${BUCKET}/" \
+                 --exclude "*.part" --exclude "*.ytdl" --exclude "*.temp.*" --exclude "*.f[0-9]*.*" \
+                 --delete-empty-src-dirs --retries 5; then
+              rm -f upload_failed.txt   # everything that failed earlier is now uploaded
+              find downloads -type f -delete 2>/dev/null || true
+              find downloads -mindepth 1 -type d -empty -delete 2>/dev/null || true
+            else
+              echo "::error::Sweep upload to B2 failed after: $url"
+              echo "sweep failed after: $url" >> upload_failed.txt
+            fi
+
+            df -h / | tail -n1
+          done 3< links.txt
 
           echo "============================================================"
-          echo "[*] Batch summary: $SUCCESS_COUNT succeeded, $FAILED_COUNT failed/skipped."
+          echo "[*] Batch summary: $SUCCESS_COUNT succeeded, $FAILED_COUNT failed."
+          for u in "${FAILED_URLS[@]}"; do echo "    failed: $u"; done
           echo "============================================================"
 
-          rm -f cookies.txt links.txt
+          # 5. Make the job red when anything failed
+          EXIT_CODE=0
+          if [ -s upload_failed.txt ]; then
+            echo "::error::Some files could not be uploaded to B2:"
+            cat upload_failed.txt
+            EXIT_CODE=1
+          fi
+          if [ "$FAILED_COUNT" -gt 0 ]; then
+            EXIT_CODE=1
+          fi
+          exit "$EXIT_CODE"
 
-      - name: Commit and Push Updated archive.txt
+      - name: Commit and Push Updated Archive
+        if: always()   # save progress even if the download step failed or timed out
+        env:
+          QUALITY: ${{ inputs.quality }}
         run: |
+          [ -d archives ] || { echo "No archives directory, nothing to commit"; exit 0; }
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add archive.txt
+          git add archives/
           if git diff --staged --quiet; then
-            echo "No changes to archive.txt"
-          else
-            git commit -m "Update download archive [skip ci]"
-            git push
+            echo "No changes to archive"
+            exit 0
           fi
+          git commit -m "Update download archive (${QUALITY}) [skip ci]"
+          for i in 1 2 3; do
+            if git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && git push; then
+              exit 0
+            fi
+            echo "Push attempt $i failed, retrying..."
+            sleep $((i * 5))
+          done
+          echo "::error::Could not push archive update"
+          exit 1
