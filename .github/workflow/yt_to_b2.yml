@@ -1,0 +1,132 @@
+name: Archive YouTube to Backblaze B2
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'YouTube URL (Single Video, Playlist, or Channel @user/videos)'
+        required: true
+        type: string
+        default: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'
+
+      quality:
+        description: 'Select Video / Audio Quality'
+        required: true
+        type: choice
+        default: '1080p'
+        options:
+          - '4k_best'
+          - '1080p'
+          - '720p'
+          - '480p'
+          - 'audio_only_mp3'
+          - 'audio_only_best'
+
+      max_downloads:
+        description: 'Max items to download this run (leave blank or 0 for unlimited)'
+        required: false
+        type: string
+        default: '25'
+
+jobs:
+  archive-to-b2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350 # Stays safely under GitHub's 6-hour execution limit
+
+    permissions:
+      contents: write # Needed to commit and push archive.txt back to repo
+
+    steps:
+      - name: Checkout Repository (For archive.txt persistence)
+        uses: actions/checkout@v4
+
+      - name: Install yt-dlp, FFmpeg, aria2, and rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg aria2 rclone
+          pip install --upgrade yt-dlp
+
+      - name: Configure rclone for Backblaze B2
+        env:
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APP_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+        run: |
+          mkdir -p ~/.config/rclone
+          cat <<EOF > ~/.config/rclone/rclone.conf
+          [b2]
+          type = b2
+          account = ${B2_KEY_ID}
+          key = ${B2_APP_KEY}
+          hard_delete = true
+          EOF
+
+      - name: Download & Upload Stream to B2
+        env:
+          TARGET_URL: ${{ inputs.target_url }}
+          QUALITY: ${{ inputs.quality }}
+          MAX_DOWNLOADS: ${{ inputs.max_downloads }}
+          BUCKET: ${{ secrets.B2_BUCKET_NAME }}
+        run: |
+          # 1. Initialize archive.txt if new
+          touch archive.txt
+          mkdir -p downloads
+
+          # 2. Configure format flags based on user selection
+          EXTRA_FLAGS=""
+          OUTPUT_PATH="downloads/%(uploader,channel|Unknown)s/%(upload_date>%Y-%m-%d)s - %(title)s [%(id)s].%(ext)s"
+
+          case "$QUALITY" in
+            4k_best)
+              FORMAT_FLAG='-f bestvideo+bestaudio/best --merge-output-format mp4'
+              ;;
+            1080p)
+              FORMAT_FLAG='-f bestvideo[height<=1080]+bestaudio/best[height<=1080] --merge-output-format mp4'
+              ;;
+            720p)
+              FORMAT_FLAG='-f bestvideo[height<=720]+bestaudio/best[height<=720] --merge-output-format mp4'
+              ;;
+            480p)
+              FORMAT_FLAG='-f bestvideo[height<=480]+bestaudio/best[height<=480] --merge-output-format mp4'
+              ;;
+            audio_only_mp3)
+              FORMAT_FLAG='-x --audio-format mp3 --audio-quality 0 --embed-thumbnail --add-metadata'
+              ;;
+            audio_only_best)
+              FORMAT_FLAG='-x --audio-format best --audio-quality 0 --embed-thumbnail --add-metadata'
+              ;;
+          esac
+
+          # 3. Handle max downloads if specified
+          if [ -n "$MAX_DOWNLOADS" ] && [ "$MAX_DOWNLOADS" != "0" ]; then
+            EXTRA_FLAGS="$EXTRA_FLAGS --max-downloads $MAX_DOWNLOADS"
+          fi
+
+          echo "[*] Target URL: $TARGET_URL"
+          echo "[*] Format Flags: $FORMAT_FLAG"
+
+          # 4. Execute yt-dlp
+          # Uploads each file immediately with rclone and removes it to save runner disk
+          yt-dlp \
+            $FORMAT_FLAG \
+            $EXTRA_FLAGS \
+            --download-archive "archive.txt" \
+            --output "$OUTPUT_PATH" \
+            --external-downloader aria2c \
+            --external-downloader-args "-x 16 -s 16 -k 1M" \
+            --sleep-interval 3 \
+            --max-sleep-interval 8 \
+            --ignore-errors \
+            --exec "rclone copy {} b2:${BUCKET}/youtube/ && rm -f {}" \
+            "$TARGET_URL"
+
+      - name: Commit and Push Updated archive.txt
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add archive.txt
+          if git diff --staged --quiet; then
+            echo "No changes to archive.txt"
+          else
+            git commit -m "Update download archive [skip ci]"
+            git push
+          fi
