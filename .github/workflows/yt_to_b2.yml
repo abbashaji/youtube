@@ -23,7 +23,7 @@ on:
           - 'audio_only_best'
 
       max_downloads:
-        description: 'Max items to download this run (leave blank or 0 for unlimited)'
+        description: 'Max items per target URL (leave blank or 0 for unlimited)'
         required: false
         type: string
         default: '25'
@@ -73,24 +73,16 @@ jobs:
           touch archive.txt
           mkdir -p downloads
 
-          # Parse and sanitize input URLs into links.txt
-          printf "%s\n" "$RAW_URLS" | sed '/^[[:space:]]*$/d' > links.txt
-          echo "[*] Queued URLs for download:"
-          cat links.txt
+          # 1. Parse and sanitize input URLs (strip carriage returns and blank lines)
+          printf "%s\n" "$RAW_URLS" | tr -d '\r' | sed '/^[[:space:]]*$/d' > links.txt
+          echo "[*] Total queued URLs: $(wc -l < links.txt)"
 
-          # Check if YouTube URL is present
-          SITE_SPECIFIC_ARGS=()
-          if grep -Eq 'youtube\.com|youtu\.be' links.txt; then
-            echo "[*] YouTube URL detected. Applying bypasses."
-            if [ -n "$YT_COOKIES" ]; then
-              printf "%s\n" "$YT_COOKIES" > cookies.txt
-              SITE_SPECIFIC_ARGS+=(--cookies cookies.txt)
-            fi
-            SITE_SPECIFIC_ARGS+=(--remote-components ejs:github)
-            SITE_SPECIFIC_ARGS+=(--extractor-args "youtube:player_client=web,tv")
+          # 2. Setup cookies if provided
+          if [ -n "$YT_COOKIES" ]; then
+            printf "%s\n" "$YT_COOKIES" > cookies.txt
           fi
 
-          # Format Selector
+          # 3. Format Selectors
           EXTRA_FLAGS=()
           OUTPUT_PATH="downloads/%(extractor)s/%(uploader,channel|Unknown)s/%(upload_date>%Y-%m-%d)s - %(title)s [%(id)s].%(ext)s"
 
@@ -119,25 +111,49 @@ jobs:
             EXTRA_FLAGS+=(--max-downloads "$MAX_DOWNLOADS")
           fi
 
-          # Execute yt-dlp with tolerance for individual link failures
-          yt-dlp \
-            "${FORMAT_ARGS[@]}" \
-            "${EXTRA_FLAGS[@]}" \
-            "${SITE_SPECIFIC_ARGS[@]}" \
-            --download-archive "archive.txt" \
-            --output "$OUTPUT_PATH" \
-            --external-downloader aria2c \
-            --external-downloader-args "aria2c:-x 16 -s 16 -k 1M" \
-            --sleep-interval 1 \
-            --max-sleep-interval 4 \
-            --ignore-errors \
-            --no-abort-on-error \
-            --exec "rclone move %(filepath)q b2:${BUCKET}/%(extractor)q/%(uploader,channel|Unknown)q/ --delete-empty-src-dirs" \
-            -a links.txt || YTDLP_EXIT_CODE=$?
+          # 4. Loop URL-by-URL so a 404/broken link never aborts the other URLs
+          FAILED_COUNT=0
+          SUCCESS_COUNT=0
 
-          if [ "${YTDLP_EXIT_CODE:-0}" -ne 0 ]; then
-            echo "::warning::One or more links failed or were skipped (code: $YTDLP_EXIT_CODE), but valid downloads proceeded."
-          fi
+          while IFS= read -r url || [ -n "$url" ]; do
+            [[ -z "$url" || "$url" =~ ^[[:space:]]*# ]] && continue
+
+            echo "============================================================"
+            echo "[*] Processing target: $url"
+            echo "============================================================"
+
+            CURRENT_SITE_ARGS=()
+            if echo "$url" | grep -Eq 'youtube\.com|youtu\.be'; then
+              [ -f cookies.txt ] && CURRENT_SITE_ARGS+=(--cookies cookies.txt)
+              CURRENT_SITE_ARGS+=(--remote-components ejs:github)
+              CURRENT_SITE_ARGS+=(--extractor-args "youtube:player_client=web,tv")
+            fi
+
+            if yt-dlp \
+              "${FORMAT_ARGS[@]}" \
+              "${EXTRA_FLAGS[@]}" \
+              "${CURRENT_SITE_ARGS[@]}" \
+              --download-archive "archive.txt" \
+              --output "$OUTPUT_PATH" \
+              --external-downloader aria2c \
+              --external-downloader-args "aria2c:-x 16 -s 16 -k 1M" \
+              --sleep-interval 1 \
+              --max-sleep-interval 4 \
+              --ignore-errors \
+              --exec "rclone move %(filepath)q b2:${BUCKET}/%(extractor)q/%(uploader,channel|Unknown)q/ --delete-empty-src-dirs" \
+              "$url"; then
+                echo "[✓] Finished processing: $url"
+                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            else
+                echo "::warning::Skipping bad/broken link (404/Private/Deleted): $url"
+                FAILED_COUNT=$((FAILED_COUNT + 1))
+            fi
+
+          done < links.txt
+
+          echo "============================================================"
+          echo "[*] Batch summary: $SUCCESS_COUNT succeeded, $FAILED_COUNT failed/skipped."
+          echo "============================================================"
 
           rm -f cookies.txt links.txt
 
