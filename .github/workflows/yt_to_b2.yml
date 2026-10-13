@@ -44,7 +44,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg aria2 rclone
-          # Install Deno JS runtime (needed for YouTube & certain challenge-based sites)
+          # Install Deno JS runtime (needed for YouTube & JS challenge-based extractors)
           curl -fsSL https://deno.land/install.sh | sh
           echo "$HOME/.deno/bin" >> $GITHUB_PATH
           pip install --upgrade yt-dlp
@@ -74,7 +74,7 @@ jobs:
           touch archive.txt
           mkdir -p downloads
 
-          # 1. Check if the target is YouTube or another site
+          # 1. Detect if the target is YouTube or another site
           IS_YOUTUBE=false
           if echo "$TARGET_URL" | grep -Eq 'youtube\.com|youtu\.be'; then
             IS_YOUTUBE=true
@@ -83,7 +83,7 @@ jobs:
             echo "[*] Detected non-YouTube URL. Using universal extractor rules."
           fi
 
-          # 2. Handle Cookies & Site-Specific Flags
+          # 2. Site-specific flags and authentication
           SITE_SPECIFIC_ARGS=()
           if [ "$IS_YOUTUBE" = true ]; then
             if [ -n "$YT_COOKIES" ]; then
@@ -94,7 +94,7 @@ jobs:
             SITE_SPECIFIC_ARGS+=(--extractor-args "youtube:player_client=web,tv")
           fi
 
-          # 3. Resilient Format Selectors across all sites
+          # 3. Format Selectors
           EXTRA_FLAGS=()
           OUTPUT_PATH="downloads/%(extractor)s/%(uploader,channel|Unknown)s/%(upload_date>%Y-%m-%d)s - %(title)s [%(id)s].%(ext)s"
 
@@ -125,7 +125,7 @@ jobs:
 
           echo "[*] Target URL: $TARGET_URL"
 
-          # 4. Universal Download and Upload Execution
+          # 4. Execute download with safe %(extractor)q escaping
           yt-dlp \
             "${FORMAT_ARGS[@]}" \
             "${EXTRA_FLAGS[@]}" \
@@ -137,7 +137,7 @@ jobs:
             --sleep-interval 1 \
             --max-sleep-interval 4 \
             --ignore-errors \
-            --exec "rclone copy {} b2:${BUCKET}/%(extractor)s/ && rm -f {}" \
+            --exec "rclone move {} b2:${BUCKET}/%(extractor)q/ --delete-empty-src-dirs" \
             "$TARGET_URL"
 
           # Clean up temporary cookie file if created
