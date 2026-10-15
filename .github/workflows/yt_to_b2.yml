@@ -53,7 +53,7 @@ jobs:
       - name: Set up Deno (JS runtime for YouTube challenges)
         uses: denoland/setup-deno@v2
         with:
-          deno-version: '2.1.4'   # pinned; yt-dlp needs Deno >= 2.0
+          deno-version: v2.x   # yt-dlp's EJS solver needs Deno >= 2.3.0
 
       - name: Install Dependencies (FFmpeg, aria2, rclone, yt-dlp)
         run: |
